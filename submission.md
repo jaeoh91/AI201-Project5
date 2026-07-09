@@ -138,3 +138,30 @@ returns **three identical `Crown Heights Anthem` rows** — one per tag. Then, i
 - `.venv/bin/pytest tests/` → 12 passed, 1 failed; all 5 search tests pass, and the one failure is `test_streak_increments_on_sunday` (known open issue #1, unrelated).
 
 **AI usage.** AI agent (Cursor) performed the reproduction, the three-way query execution comparison that pinned down the uniquing behavior, the fix, and the verification; I reviewed the diff and the RCA.
+
+## Issue #4 — Notified on playlist-add but not on rating
+
+**How I reproduced it.** The seed data already includes a working `song_added_to_playlist` notification for nova (darius added nova's "Midnight Drive" to a playlist). I looked up IDs from the DB, then called `rate_song(darius, midnight_drive_id, 5)` directly in an app context and checked nova's notifications via `get_notifications()`:
+
+- **Before:** 1 notification, type `song_added_to_playlist`.
+- **After rating:** still 1 notification — the rating was saved to the `Rating` table, but no new row appeared in `Notification`.
+
+Same pattern as the bug report: playlist-add notifies the sharer; rating does not.
+
+**How I found the root cause.** Both actions live in the same file and are wired through the same routes layer. `routes/playlists.py::add_song()` → `notification_service.add_to_playlist()`, and `routes/songs.py::rate()` → `notification_service.rate_song()`. Reading the two functions side by side: `add_to_playlist()` saves the playlist change, then — if `song.shared_by != added_by_user_id` — calls `create_notification(...)` with type `song_added_to_playlist`. `rate_song()` validates input, creates/updates the `Rating`, commits, and returns — it never calls `create_notification()` at all. The moment of confidence was seeing that the helper and the notification type string `song_rated` already exist in `create_notification()`'s docstring, but nothing in `rate_song()` invokes it.
+
+**Root cause.** `rate_song()` is missing the notification side effect that `add_to_playlist()` already implements. After saving a rating, the function returns without checking whether the rater is someone other than the song's original sharer (`song.shared_by`) and without calling `create_notification()`.
+
+**Fix and side-effect check.** Added the same guard-and-notify block from `add_to_playlist()` to the end of `rate_song()`, after the rating commit:
+
+- If `song.shared_by != user_id`, call `create_notification(user_id=song.shared_by, notification_type="song_rated", body=f"{rater.username} rated your song '{song.title}' {score}/5.")`.
+
+Verified afterward:
+
+- Friend rates sharer's song → sharer gets a `song_rated` notification with the correct body.
+- Self-rating (nova rates her own "Midnight Drive") → notification count unchanged.
+- Re-rating the same song → a new notification is created (consistent with `add_to_playlist()`, which also notifies on every call even when the song is already in the playlist).
+- Invalid score still raises `ValueError` before any notification is created.
+- `.venv/bin/pytest tests/` → 12 passed, 1 failed; the failure is `test_streak_increments_on_sunday` (known open issue #1, unrelated).
+
+**AI usage.** AI agent (Cursor) performed the reproduction, compared the two functions in `notification_service.py`, implemented the fix, and ran the side-effect checks; I reviewed the diff and the RCA.
