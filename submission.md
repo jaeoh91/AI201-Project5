@@ -189,3 +189,32 @@ That's the reported symptom: someone who listened hours ago (effectively "yester
 - `.venv/bin/pytest tests/` → 12 passed, 1 failed; the failure is `test_streak_increments_on_sunday` (known open issue #1, unrelated).
 
 **AI usage.** AI agent (Cursor) performed the reproduction (including the dedup-masking scenario), traced the cutoff constant against `seed_data.py`, implemented the fix, and ran boundary checks; I reviewed the diff and the RCA.
+
+## Issue #1 — My listening streak keeps resetting (reported on Sundays)
+
+**How I reproduced it.** The existing test `test_streak_increments_on_sunday` in `tests/test_streaks.py` encodes the exact scenario: listen on Saturday (`2024-06-15`, `weekday() == 5`), then on Sunday (`2024-06-16`, `weekday() == 6`). I also reproduced it directly in an app context:
+
+- After Saturday listen → `listening_streak = 1` (correct start).
+- After Sunday listen (exactly one calendar day later) → `listening_streak = 1` (wrong — should be 2).
+
+The bug only triggers when **today is Sunday** and the user listened **yesterday** (Saturday). Any other consecutive-day pair (Mon→Tue, etc.) increments correctly.
+
+**How I found the root cause.** Route `POST /songs/<id>/listen` → `streak_service.record_listening_event()` → `update_listening_streak()`. The streak logic compares calendar dates via `days_since_last = (today - last_date).days`. The increment branch read:
+
+```python
+elif days_since_last == 1 and today.weekday() != 6:
+```
+
+The moment of confidence was matching the symptom to that condition: in Python, `weekday()` returns `6` for Sunday, so on Sunday with `days_since_last == 1` the condition is **False**, execution falls through to the `else` branch, and the streak resets to 1 instead of incrementing.
+
+**Root cause.** `update_listening_streak()` treats Sunday as a special case with `today.weekday() != 6`, incorrectly blocking streak increments when the user listens on consecutive days ending on a Sunday. The streak rules in the docstring say nothing about skipping Sundays — only "listened yesterday → increment."
+
+**Fix and side-effect check.** Removed the erroneous Sunday guard so the branch is simply `elif days_since_last == 1:`. Verified afterward:
+
+- Saturday → Sunday: streak goes 1 → 2 ✓
+- Monday → Tuesday (existing test): still increments ✓
+- Same-day double listen: no double-count ✓
+- Skipped day (Mon → Wed): still resets to 1 ✓
+- `.venv/bin/pytest tests/` → **13 passed, 0 failed** (all streak tests green for the first time).
+
+**AI usage.** AI agent (Cursor) ran the failing test and a direct reproduction, identified the `weekday() != 6` guard, applied the one-line fix, and verified all streak boundary cases; I reviewed the diff and the RCA.
