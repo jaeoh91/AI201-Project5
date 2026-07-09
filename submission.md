@@ -165,3 +165,27 @@ Verified afterward:
 - `.venv/bin/pytest tests/` → 12 passed, 1 failed; the failure is `test_streak_increments_on_sunday` (known open issue #1, unrelated).
 
 **AI usage.** AI agent (Cursor) performed the reproduction, compared the two functions in `notification_service.py`, implemented the fix, and ran the side-effect checks; I reviewed the diff and the RCA.
+
+## Issue #2 — Friends Listening Now shows people from yesterday
+
+**How I reproduced it.** `seed_data.py` creates two tiers of listening events: three friends (darius, simone, kenji) listened 10–20 minutes ago (should appear), and a separate loop creates older events at 2h, 10h, 18h, etc. (should not). Right after a fresh reseed, the bug is masked by deduplication — each friend has both a recent and an old event, so the feed shows the recent one. To expose it, I deleted darius's 10-minute-old event so his only remaining listen was 10 hours ago, then called `get_friends_listening_now(nova.id)`:
+
+- `RECENT_THRESHOLD` was `timedelta(hours=24)`.
+- Darius's most recent event was **10 hours ago**.
+- Darius still appeared in nova's "Friends Listening Now" feed.
+
+That's the reported symptom: someone who listened hours ago (effectively "yesterday" from the user's perspective) shows up in a feature named "Listening Now."
+
+**How I found the root cause.** Route `routes/feed.py::listening_now()` → `feed_service.get_friends_listening_now()`. The function filters with `ListeningEvent.listened_at >= cutoff` where `cutoff = now - RECENT_THRESHOLD`. Reading `seed_data.py` confirmed the intended window: its comment on the recent events says *"within the past 30 minutes — should appear in 'listening now'"*, while the older loop says those should *not* appear after the fix. The moment of confidence was seeing `RECENT_THRESHOLD = timedelta(hours=24)` at the top of `feed_service.py` — a 24-hour window for a feature called "Listening Now" includes any listen from the past day, not just the last half hour.
+
+**Root cause.** `RECENT_THRESHOLD` is set to `timedelta(hours=24)` instead of a short "right now" window. The cutoff is far too permissive: any friend's listening event from the last 24 hours passes the filter, so stale listens from hours ago (or calendar-yesterday evening) appear in "Friends Listening Now."
+
+**Fix and side-effect check.** One-line change in `services/feed_service.py`: `timedelta(hours=24)` → `timedelta(minutes=30)`, matching the seed data's intended recency window. Verified afterward:
+
+- Fresh seed → feed returns 3 friends, all within 10–20 minutes.
+- Darius with only a 10-hour-old listen → **not** in feed (was in feed before fix).
+- Boundary: events at 25 minutes ago (inside) and 35 minutes ago (outside) → feed shows the 25-minute event only; the 35-minute one is excluded.
+- `get_activity_feed()` unchanged — still returns older events by limit, unaffected by `RECENT_THRESHOLD`.
+- `.venv/bin/pytest tests/` → 12 passed, 1 failed; the failure is `test_streak_increments_on_sunday` (known open issue #1, unrelated).
+
+**AI usage.** AI agent (Cursor) performed the reproduction (including the dedup-masking scenario), traced the cutoff constant against `seed_data.py`, implemented the fix, and ran boundary checks; I reviewed the diff and the RCA.
