@@ -114,3 +114,27 @@ Same result on all three seeded playlists: the DB has 7 entries, the API returns
 **AI usage.** AI agent (Cursor) performed the reproduction, trace, fix, and verification following the workflow in AGENTS.md; I reviewed the diff and the RCA.
 
 **Side note (not one of the five, not fixed).** While boundary-testing with a freshly created playlist, `POST /playlists/<id>/songs` returned a 500: `IntegrityError: NOT NULL constraint failed: playlist_entries.position`. `notification_service.add_to_playlist()` appends via `playlist.songs.append(song)`, which inserts a `playlist_entries` row without a `position`, but the column is `nullable=False` — only the seed script sets positions explicitly. So adding a song through the API can never succeed. Noting it here per the project rules instead of fixing it.
+
+## Issue #3 — The same song keeps showing up twice in search (inconsistently)
+
+**How I reproduced it.** The seed data has songs with 0, 1, and 3+ tags precisely for this bug ("Crown Heights Anthem" has 3 tags). I first confirmed the row multiplication at the SQL level — running the service's exact SQL directly against the database:
+
+```
+sqlite3 instance/mixtape.db "select s.title from song s left join song_tags st on st.song_id = s.id
+  where s.title like '%Anthem%' or s.artist like '%Anthem%';"
+```
+
+returns **three identical `Crown Heights Anthem` rows** — one per tag. Then, in an app context, I executed the service's query in three ways: the legacy `Query.all()` the code uses returned 1 result, but executing the *same statement* row-by-row (`session.execute(q.statement)`) returned 3, and the identical join written 2.0-style (`select(Song)` + `.scalars()`) also returned 3 duplicates.
+
+**How I found the root cause.** Route `routes/songs.py::search()` → `search_service.search_songs()`. The function did an `.outerjoin(song_tags, Song.id == song_tags.c.song_id)` before filtering on title/artist. The moment of confidence was the SQL check above: an outer join to `song_tags` produces one row per (song, tag) pair, so a 3-tag song matches as 3 rows. Crucially, nothing in the query ever *uses* the join — the filter only touches `Song.title`/`Song.artist`, and the tags in the response come from `Song.to_dict()`, which reads the `song.tags` relationship, not the join.
+
+**Root cause.** The `outerjoin` to `song_tags` in `search_songs()` multiplies each matching song by its tag count (an N-tag song becomes N identical rows; the docstring's "along with their associated tags" suggests the join was added under the mistaken belief it was needed to load tags). The "inconsistently" part of the symptom is explained by SQLAlchemy's legacy-`Query` entity uniquing: when full entities are fetched via `Query.all()`, the ORM deduplicates identical rows client-side, masking the bug — but the exact same statement executed any other way (raw rows, 2.0-style `select()`, or after a library migration) returns the duplicates. The query was silently fetching and discarding 3x the rows either way.
+
+**Fix and side-effect check.** Removed the unused `.outerjoin(song_tags, ...)` line in `services/search_service.py` — the filter and the tag serialization are both unaffected by it. Verified afterward:
+
+- Raw SQL without the join returns exactly one row per matching song.
+- Service calls for a 3-tag song ("Anthem"), a 0-tag song ("Midnight"), a multi-song artist match ("Elara Moon"), a broad query ("a" → all 13 songs, no duplicates), and a no-match query (returns `[]`) — all correct.
+- Over HTTP on a fresh server: `GET /songs/search?q=Anthem` returns `count: 1` with all 3 tags present in the result, and `q=a` returns 13 unique titles. `GET /songs/<id>` (the other function in the same service) still returns the song with its tags.
+- `.venv/bin/pytest tests/` → 12 passed, 1 failed; all 5 search tests pass, and the one failure is `test_streak_increments_on_sunday` (known open issue #1, unrelated).
+
+**AI usage.** AI agent (Cursor) performed the reproduction, the three-way query execution comparison that pinned down the uniquing behavior, the fix, and the verification; I reviewed the diff and the RCA.
